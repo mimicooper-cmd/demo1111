@@ -1,0 +1,393 @@
+const {exec} = require('node:child_process');
+const path = require('node:path');
+const defaults = require('lodash.defaults');
+const webpack = require('webpack');
+
+// Plugins
+const BundleAnalyzerPlugin = require('webpack-bundle-analyzer').BundleAnalyzerPlugin;
+const CopyWebpackPlugin = require('copy-webpack-plugin');
+const EmitFilePlugin = require('emit-file-webpack-plugin');
+const HtmlWebpackPlugin = require('html-webpack-plugin');
+const MiniCssExtractPlugin = require('mini-css-extract-plugin');
+const TerserPlugin = require('terser-webpack-plugin');
+
+// PostCss
+const autoprefixer = require('autoprefixer');
+
+/** @type {Array} */
+let routes = require('./src/routes.json');
+const templateConfig = require('./src/template-config.js');
+
+if (process.env.NODE_ENV !== 'production') {
+    routes = routes.concat(require('./src/routes-dev.json')); // eslint-disable-line global-require
+}
+
+routes = routes.filter(route => !process.env.VIEW || process.env.VIEW === route.view);
+
+const pageRoutes = routes.filter(route => !route.redirect);
+
+/**
+ * Load the package.json for an installed npm package.
+ * Uses {@link require.resolve} to locate the package via Node's module resolution algorithm,
+ * which handles hoisting and workspaces. The resolved value is a file path, so the subsequent
+ * {@link require} call is a direct file access that bypasses the package's `exports` restriction
+ * on `./package.json`.
+ * @param {string} packageName The package name to look up.
+ * @returns {object} The parsed package.json contents.
+ */
+const requirePackageJson = packageName => {
+    let dir = path.dirname(require.resolve(packageName));
+    do {
+        try {
+            const pkg = require(path.join(dir, 'package.json')); // eslint-disable-line global-require
+            if (pkg.name === packageName) return pkg;
+        } catch { /* no package.json here, keep walking up */ }
+        dir = path.dirname(dir);
+    } while (dir !== path.dirname(dir));
+    throw new Error(`Could not find package.json for ${packageName}`);
+};
+
+const guiVersion = requirePackageJson('@scratch/scratch-gui').version;
+
+// Resolved once at module load time so both version files share the same git call.
+// git rev-parse's abbreviated hash uses a dynamic unique-prefix algorithm, matching GitHub's web UI.
+const gitHashesPromise = process.env.WWW_VERSION ?
+    Promise.resolve({fullHash: process.env.WWW_VERSION, shortHash: process.env.WWW_VERSION}) :
+    new Promise((resolve, reject) => {
+        exec('git log -1 --format="%H %h"', (err, stdout) => {
+            if (err) {
+                reject(err);
+            } else {
+                const [fullHash, shortHash] = stdout.trim().split(' ');
+                resolve({fullHash, shortHash});
+            }
+        });
+    });
+
+/** @returns {Promise<string>} Abbreviated git hash for display in version.txt. */
+const makeVersionTxt = () => gitHashesPromise.then(({shortHash}) => shortHash);
+
+/** @returns {Promise<string>} JSON string with full git hash and package versions for version.json. */
+const makeVersionJson = () => gitHashesPromise.then(({fullHash}) => JSON.stringify({
+    'scratch-www': fullHash,
+    'scratch-gui': guiVersion
+}, null, 4));
+
+// Prepare all entry points
+const entry = {};
+
+pageRoutes.forEach(route => {
+    entry[route.name] = [
+        './src/init.js',
+        `./src/views/${route.view}.jsx`
+    ];
+});
+
+// HtmlWebpackPlugin v4 removed 'chunks' info that we need for our custom template.
+// This plugin is a quick-and-dirty partial implementation of that information.
+// Adapted from https://github.com/jantimon/html-webpack-plugin/issues/1369#issuecomment-1049968234
+// Thanks, @daniel-nagy!
+class HtmlWebpackBackwardsCompatibilityPlugin {
+    apply (compiler) {
+        compiler
+            .hooks
+            .compilation
+            .tap('HtmlWebpackBackwardsCompatibilityPlugin', compilation => {
+                HtmlWebpackPlugin
+                    .getHooks(compilation)
+                    .beforeAssetTagGeneration
+                    .tapAsync(
+                        'HtmlWebpackBackwardsCompatibilityPlugin',
+                        (data, callback) => {
+                            const {publicPath} = data.assets;
+                            const chunks = {};
+
+                            for (const entryPoint of compilation.entrypoints.values()) {
+                                for (const chunk of entryPoint.chunks) {
+                                    const files = Array.from(chunk.files); // convert from Set
+                                    chunks[chunk.name] = {
+                                        entry: publicPath + files.find(file => file.endsWith('.js')),
+                                        css: files
+                                            .filter(file => file.endsWith('.css'))
+                                            .map(file => publicPath + file)
+                                    };
+                                }
+                            }
+
+                            data.assets.chunks = chunks;
+
+                            callback(null, data);
+                        }
+                    );
+            });
+    }
+}
+
+// Config
+module.exports = {
+    entry: entry,
+    devtool: process.env.NODE_ENV === 'production' ? false : 'eval',
+    mode: process.env.NODE_ENV === 'production' ? 'production' : 'development',
+    output: {
+        path: path.resolve(__dirname, 'build'),
+        filename: 'js/[name].bundle.js',
+        publicPath: '/'
+    },
+    resolve: {
+        fallback: {
+            // Node modules are no longer polyfilled by default in Webpack 5, so we need to add these here
+            Buffer: require.resolve('buffer/'),
+            stream: require.resolve('stream-browserify') // jszip
+        },
+        symlinks: false // Fix local development with `npm link` packages
+    },
+    module: {
+        rules: [
+            {
+                test: /\.(?:js|mjs|cjs)x?$/,
+                loader: 'babel-loader',
+                include: [
+                    path.resolve(__dirname, 'src'),
+                    /node_modules[\\/]scratch-[^\\/]+[\\/]src/,
+                    /node_modules[\\/]pify/,
+                    /node_modules[\\/]async/
+                ],
+                options: {
+                    presets: ['@babel/preset-env', '@babel/preset-react']
+                }
+            },
+            {
+                test: /\.hex$/,
+                type: 'asset/resource',
+                use: [{
+                    loader: 'url-loader',
+                    options: {
+                        limit: 16 * 1024
+                    }
+                }]
+            },
+            {
+                test: /\.scss$/,
+                use: [
+                    MiniCssExtractPlugin.loader,
+                    {
+                        loader: 'css-loader',
+                        options: {
+                            url: false
+                        }
+                    },
+                    {
+                        loader: 'postcss-loader',
+                        options: {
+                            postcssOptions: {
+                                plugins: function () {
+                                    return [autoprefixer()];
+                                }
+                            }
+                        }
+                    },
+                    {
+                        loader: 'sass-loader',
+                        // Silencing deprecation warnings for using legacy-js-api
+                        // https://sass-lang.com/documentation/breaking-changes/legacy-js-api/
+                        // The legacy api will be removed entirely in Dart Sass 2.0.0
+                        options: {
+                            sassOptions: {
+                                silenceDeprecations: ['legacy-js-api']
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                test: /\.css$/,
+                use: [
+                    {
+                        loader: 'style-loader'
+                    },
+                    {
+                        loader: 'css-loader',
+                        options: {
+                            modules: {
+                                auto: true,
+                                localIdentName: '[name]_[local]_[hash:base64:5]',
+                                exportLocalsConvention: 'camelCase'
+                            },
+                            importLoaders: 1,
+                            esModule: false
+                        }
+                    },
+                    {
+                        loader: 'postcss-loader',
+                        options: {
+                            postcssOptions: {
+                                plugins: [
+                                    'postcss-import',
+                                    'postcss-simple-vars',
+                                    'autoprefixer'
+                                ]
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                test: /\.(png|jpg|gif|eot|svg|ttf|woff)$/,
+                loader: 'url-loader'
+            }
+        ],
+        noParse: /node_modules\/google-libphonenumber\/dist/
+    },
+    optimization: {
+        splitChunks: {
+            cacheGroups: {
+                common: {
+                    chunks: 'all',
+                    name: 'common',
+                    minSize: 1024,
+                    minChunks: pageRoutes.length // Extract only chunks common to all html pages
+                }
+            }
+        },
+        minimizer: [
+            new TerserPlugin({
+                parallel: 4
+            })
+        ]
+    },
+    plugins: [
+        new MiniCssExtractPlugin(),
+        new HtmlWebpackBackwardsCompatibilityPlugin(),
+        new EmitFilePlugin({
+            filename: 'version.txt',
+            content: makeVersionTxt
+        }),
+        new EmitFilePlugin({
+            filename: 'version.json',
+            content: makeVersionJson
+        }),
+        new webpack.ProvidePlugin({
+            Buffer: ['buffer', 'Buffer']
+        })
+    ].concat(pageRoutes
+        .map(route => new HtmlWebpackPlugin(defaults({}, {
+            title: route.title,
+            filename: `${route.name}.html`,
+            route: route,
+            dynamicMetaTags: route.dynamicMetaTags
+        }, templateConfig)))
+    ).concat([
+        new CopyWebpackPlugin({
+            patterns: [
+                {from: 'static'},
+                {from: 'intl', to: 'js'},
+                {
+                    from: 'node_modules/@scratch/scratch-gui/dist/static/blocks-media',
+                    to: 'static/blocks-media'
+                },
+                {
+                    from: 'node_modules/@scratch/scratch-gui/dist/chunks/mediapipe/face_detection/',
+                    to: 'chunks/mediapipe/face_detection'
+                },
+                {
+                    context: 'node_modules/@scratch/scratch-gui/dist/',
+                    from: 'chunks/fetch-worker.*.{js,js.map}'
+                },
+                {
+                    context: 'node_modules/@scratch/scratch-gui/dist/',
+                    // Copy the scripts for loading the translated images
+                    // Their chunks are expected to be on the same path as the assets themselves.
+                    from: 'chunks/*-steps.*.{js,js.map}',
+                    to: 'js'
+                },
+                {
+                    from: 'node_modules/@scratch/scratch-gui/dist/extension-worker.js'
+                },
+                {
+                    from: 'node_modules/@scratch/scratch-gui/dist/extension-worker.js.map'
+                },
+                {
+                    from: 'node_modules/@scratch/scratch-gui/dist/static/assets',
+                    // `publicPath: auto` in scratch-gui is searching for the assets in `/js`, because the
+                    // bundles (hence entrypoints) are located inside `/js`. If we want this to be on base level,
+                    // we'd have to change where the bundles are output as well.
+                    to: 'js/static/assets'
+                },
+                {
+                    from: 'node_modules/@scratch/scratch-gui/dist/*.hex',
+                    to: 'static',
+                    flatten: true
+                }
+            ]
+        }),
+        new webpack.DefinePlugin({
+            'process.env.NODE_ENV': `"${process.env.NODE_ENV || 'development'}"`,
+            'process.env.API_HOST': `"${process.env.API_HOST || 'https://api.scratch.mit.edu'}"`,
+            'process.env.ROOT_URL': `"${process.env.ROOT_URL || 'https://scratch.mit.edu'}"`,
+            'process.env.RECAPTCHA_SITE_KEY': `"${
+                process.env.RECAPTCHA_SITE_KEY || '6Lf6kK4UAAAAABKTyvdSqgcSVASEnMrCquiAkjVW'}"`,
+            'process.env.ASSET_HOST': `"${process.env.ASSET_HOST || 'https://assets.scratch.mit.edu'}"`,
+            'process.env.BACKPACK_HOST': `"${process.env.BACKPACK_HOST || 'https://backpack.scratch.mit.edu'}"`,
+            'process.env.CLOUDDATA_HOST': `"${process.env.CLOUDDATA_HOST || 'clouddata.scratch.mit.edu'}"`,
+            'process.env.PROJECT_HOST': `"${process.env.PROJECT_HOST || 'https://projects.scratch.mit.edu'}"`,
+            'process.env.STATIC_HOST': `"${process.env.STATIC_HOST || 'https://uploads.scratch.mit.edu'}"`,
+            'process.env.SCRATCH_ENV': `"${process.env.SCRATCH_ENV || 'development'}"`,
+            'process.env.THUMBNAIL_URI': `"${process.env.THUMBNAIL_URI || '/internalapi/project/thumbnail/{}/set/'}"`,
+            'process.env.THUMBNAIL_HOST': `"${process.env.THUMBNAIL_HOST || ''}"`,
+            'process.env.DEBUG': Boolean(process.env.DEBUG),
+            'process.env.GA_ID': `"${process.env.GA_ID || 'UA-000000-01'}"`,
+            'process.env.GTM_ENV_AUTH': `"${process.env.GTM_ENV_AUTH || ''}"`,
+            'process.env.GTM_ID': process.env.GTM_ID ? `"${process.env.GTM_ID}"` : null,
+            'process.env.ONBOARDING_TEST_ACTIVE': `"${
+                process.env.ONBOARDING_TEST_ACTIVE || false
+            }"`,
+            'process.env.ONBOARDING_TEST_PROJECT_IDS': `'${process.env.ONBOARDING_TEST_PROJECT_IDS || JSON.stringify(
+                {
+                    clicker: '10128368',
+                    pong: '10128515',
+                    animateCharacter: '10128067',
+                    makeItFly: '114019829',
+                    recordSound: '1031325137',
+                    makeMusic: '10012676'
+                }
+            )}'`,
+            'process.env.ONBOARDING_TESTING_STARTING_DATE': `"${
+                process.env.ONBOARDING_TESTING_STARTING_DATE || '2024-01-20'
+            }"`,
+            'process.env.ONBOARDING_TESTING_ENDING_DATE': `"${
+                process.env.ONBOARDING_TESTING_ENDING_DATE || '2030-11-20'
+            }"`,
+            'process.env.QUALITATIVE_FEEDBACK_ACTIVE': `"${
+                process.env.QUALITATIVE_FEEDBACK_ACTIVE || false
+            }"`,
+            'process.env.QUALITATIVE_FEEDBACK_STARTING_DATE': `"${
+                process.env.QUALITATIVE_FEEDBACK_STARTING_DATE || '2024-01-20'
+            }"`,
+            'process.env.QUALITATIVE_FEEDBACK_ENDING_DATE': `"${
+                process.env.QUALITATIVE_FEEDBACK_ENDING_DATE || '2024-11-20'
+            }"`,
+            // Given user frequency X, show qualitative feedback to 1 in X users
+            'process.env.QUALITATIVE_FEEDBACK_IDEAS_GENERATOR_USER_FREQUENCY': `"${
+                process.env.QUALITATIVE_FEEDBACK_IDEAS_GENERATOR_USER_FREQUENCY || 2
+            }"`,
+            'process.env.QUALITATIVE_FEEDBACK_STARTER_PROJECTS_USER_FREQUENCY': `"${
+                process.env.QUALITATIVE_FEEDBACK_STARTER_PROJECTS_USER_FREQUENCY || 2
+            }"`,
+            'process.env.QUALITATIVE_FEEDBACK_DEBUGGING_USER_FREQUENCY': `"${
+                process.env.QUALITATIVE_FEEDBACK_DEBUGGING_USER_FREQUENCY || 2
+            }"`,
+            'process.env.QUALITATIVE_FEEDBACK_TUTORIALS_USER_FREQUENCY': `"${
+                process.env.QUALITATIVE_FEEDBACK_TUTORIALS_USER_FREQUENCY || 2
+            }"`,
+            'process.env.IDEAS_GENERATOR_SOURCE': `"${
+                process.env.IDEAS_GENERATOR_SOURCE || 'https://scratch.mit.edu/projects/1108790117'
+            }"`,
+            'process.env.MANUALLY_SAVE_THUMBNAILS': `"${
+                process.env.MANUALLY_SAVE_THUMBNAILS || 'true'
+            }"`
+        })
+    ])
+        .concat(process.env.ANALYZE_BUNDLE === 'true' ? [
+            new BundleAnalyzerPlugin()
+        ] : [])
+};

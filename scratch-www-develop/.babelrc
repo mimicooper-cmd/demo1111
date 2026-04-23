@@ -1,0 +1,18 @@
+// .babelrc is an alias for .babelrc.json and uses JSON5 syntax
+{
+    "plugins": [
+        "@babel/plugin-transform-async-to-generator",
+        "@babel/plugin-transform-object-rest-spread",
+        "@babel/plugin-syntax-dynamic-import",
+        "transform-require-context"
+    ],
+    "presets": [
+        [
+            "@babel/preset-env",
+            {
+                "bugfixes": true
+            }
+        ],
+        "@babel/preset-react"
+    ]
+}
