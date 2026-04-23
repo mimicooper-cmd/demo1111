@@ -1,0 +1,55 @@
+@use "../../colors";
+@use "../../frameless";
+
+.tab-background {
+    box-shadow: 0 0 1px colors.$box-shadow-gray;
+    background-color: colors.$ui-white;
+    width: 100%;
+}
+
+.tabs {
+    background-color:  colors.$ui-white;
+    padding: 0;
+    width: frameless.$cols12;
+    justify-content: center;
+}
+
+.tabs button {
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    width: frameless.$cols2;
+    text-align: center;
+    color: colors.$header-gray;
+    background-color: transparent;
+
+    &.active {
+        border-bottom: 3px solid colors.$ui-aqua;
+
+        &:hover {
+            border-bottom: 3px solid colors.$ui-aqua;
+            color: colors.$header-gray;
+        }
+    }
+
+    &:active {
+        box-shadow: none;
+        padding: .75em 1.5em;
+    }
+
+    &:hover {
+        border-bottom: 3px solid colors.$active-dark-gray;
+    }
+
+    .tab-icon {
+        display: block;
+        margin: 0 auto;
+        margin-bottom: 4px;
+        width: 24px;
+    }
+
+    &:hover {
+        background-color: colors.$ui-white;
+        color: colors.$header-gray;
+    }
+}
